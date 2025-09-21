@@ -1,0 +1,12 @@
+{
+  "name": "pairandrank",
+  "version": "1.0.0",
+  "description": "本教材带你从空目录开始，手把手搭建一个“可以运行、可展示、可讲述”的 Node.js 游戏后端：包含玩家匹配服务与基于 Redis 的排行榜。你将按章节循序渐进，每一步都知道“在做什么”“为什么这么做”，并附上面试官常问的问题与答题要点。",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
