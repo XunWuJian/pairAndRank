@@ -1,1 +1,8 @@
-// routes will be added in Chapter 5/6
+const express = require('express');
+const matchmaking = require('./matchmaking');
+
+const router = express.Router();
+
+router.use('/matchmaking', matchmaking);
+
+module.exports = router;

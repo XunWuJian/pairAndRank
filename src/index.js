@@ -18,6 +18,9 @@ const { initRedis } = require('./config/redis');
   await initRedis();
 })();
 
+const routes = require('./routes');
+app.use('/api', routes);
+
 app.listen(PORT,()=>{
     console.log(`[server] listening on http://localhost:${PORT}`);
 })
