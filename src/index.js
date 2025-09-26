@@ -24,3 +24,19 @@ app.use('/api', routes);
 app.listen(PORT,()=>{
     console.log(`[server] listening on http://localhost:${PORT}`);
 })
+
+const { takePairAndCreateRoomAtomic } = require('./services/matchmaking');
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+(async function startWorker() {
+    while (true) {
+      try {
+        const res = await takePairAndCreateRoomAtomic();
+        if (!res) { await sleep(200); continue; }
+        console.log('[matchmaking] paired:', res.roomId, res.players);
+      } catch (e) {
+        console.error('[matchmaking] worker error:', e);
+        await sleep(500);
+      }
+    }
+  })();

@@ -29,8 +29,8 @@ router.get('/queue/size', (req, res) => {
 });
 
 // 查询房间匹配信息
-router.get('/match/:roomId', (req, res) => {
-  const room = getMatch(req.params.roomId);
+router.get('/match/:roomId', async (req, res) => {
+  const room = await getMatch(req.params.roomId);
   if (!room) return res.status(404).json({ error: 'not_found' });
   return res.status(200).json({ roomId: req.params.roomId, players: room });
 });

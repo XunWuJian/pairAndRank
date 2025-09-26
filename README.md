@@ -956,3 +956,324 @@ curl "http://localhost:3000/api/leaderboard/top?n=10"
 - 幂等与重入：重复提交出招时是否允许覆盖？建议在本章容忍覆盖，生产用版本通过版本号或 Lua 保证一次性。
 
 ---
+
+## 第12章：用 Redis List 实现匹配队列（分布式雏形）
+
+目标：将“内存队列”重构为 Redis List，使多个实例共享同一匹配队列，避免多副本不一致。
+
+### 12.1 键与队列设计
+
+- 等待队列键：`mm:queue`（List）
+  - 入队：`LPUSH mm:queue <playerId>`
+  - 出队：阻塞方式 `BRPOP mm:queue 0`（阻塞直到有元素）
+- 房间映射：`mm:room:<roomId>`（Hash）存 `{ a: playerA, b: playerB }`
+- 房间 ID：仍使用 `crypto.randomUUID()` 生成
+
+注意：若不使用 Lua 原子脚本，建议先只启动一个 Worker 实例消费队列，避免两个 Worker 各取到一个玩家后互相等待。
+
+### 12.2 服务层改造（保持对外 API 不变）
+
+将 `src/services/matchmaking.js` 从“内存数组 + Map”改为 Redis：
+
+```javascript
+// src/services/matchmaking.js（重构要点：阻塞命令用独立连接）
+const crypto = require('crypto');
+const { redis } = require('../config/redis');
+
+const QUEUE_KEY = 'mm:queue';
+
+let blocking;
+async function getBlocking() {
+  if (!blocking) {
+    blocking = redis.duplicate();
+    await blocking.connect();
+  }
+  return blocking;
+}
+
+async function joinQueue(playerId) {
+  if (!playerId) throw new Error('playerId required');
+  await redis.lPush(QUEUE_KEY, playerId);
+  return { status: 'queued' };
+}
+
+async function leaveQueue(playerId) {
+  await redis.lRem(QUEUE_KEY, 0, playerId);
+  return { status: 'left' };
+}
+
+async function getQueueSize() {
+  return await redis.lLen(QUEUE_KEY);
+}
+
+async function getMatch(roomId) {
+  const data = await redis.hGetAll(`mm:room:${roomId}`);
+  if (!data || (!data.a && !data.b)) return null;
+  return [data.a, data.b];
+}
+
+// 供 Worker 调用：阻塞拿两人并创建房间（单/多 Worker 均可）
+async function takePairAndCreateRoom() {
+  const b = await getBlocking();
+  const r1 = await b.brPop(QUEUE_KEY, 0);
+  const r2 = await b.brPop(QUEUE_KEY, 0);
+  const a = r1.element; const bPlayer = r2.element;
+  const roomId = crypto.randomUUID();
+  await redis.hSet(`mm:room:${roomId}`, { a, b: bPlayer });
+  return { roomId, players: [a, bPlayer] };
+}
+
+module.exports = { joinQueue, leaveQueue, getQueueSize, getMatch, takePairAndCreateRoom };
+```
+
+说明（本章已改为 Lua 原子配对方案）：
+- 路由层 `src/routes/matchmaking.js` 保持不变（仍调用 `joinQueue/leaveQueue/getQueueSize/getMatch`）。
+- Worker 不再使用 `BRPOP` 阻塞连接，统一走 Lua 原子脚本（见 12.5/12.5.1）。
+- 冗余代码已删除：去掉了阻塞专用连接与 `BRPOP` 版 `takePairAndCreateRoom` 实现，只保留 `takePairAndCreateRoomAtomic`。
+
+### 12.3 启动一个最简 Worker（先与 API 同进程）
+
+为了演示，在 `src/index.js` 中以后台循环的方式启动 Worker（真实项目建议单独进程/容器）：
+
+```javascript
+const { takePairAndCreateRoom } = require('./services/matchmaking');
+
+(async function startWorker() {
+  while (true) {
+    try {
+      const { roomId, players } = await takePairAndCreateRoom();
+      console.log('[matchmaking] paired:', roomId, players);
+    } catch (e) {
+      console.error('[matchmaking] worker error:', e);
+    }
+  }
+})();
+```
+
+若将来需要多实例 Worker 并行消费，请参考 12.5 的 Lua 脚本实现原子配对。
+
+### 12.4 运行与验证
+
+```bash
+# 入队四名玩家（将被依次两两配对）
+curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"alice"}'
+curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"bob"}'
+curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"carl"}'
+curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"dora"}'
+
+# 观察控制台输出 roomId 与 players；并可按 roomId 查询：
+curl http://localhost:3000/api/matchmaking/match/<roomId>
+```
+
+完成一次“猜拳”完整对战（拿到 roomId 后）：
+
+```bash
+# 双方提交出招（0=石头 1=剪子 2=布）
+curl -X POST http://localhost:3000/api/rps/submit-move -H "Content-Type: application/json" -d '{"roomId":"<roomId>","playerId":"alice","move":0}'
+curl -X POST http://localhost:3000/api/rps/submit-move -H "Content-Type: application/json" -d '{"roomId":"<roomId>","playerId":"bob","move":2}'
+
+# 查询对战结果（第二次提交后通常立即变为 resolved）
+curl http://localhost:3000/api/rps/result/<roomId>
+
+# 查看排行榜是否为胜者加分
+curl "http://localhost:3000/api/leaderboard/top?n=10"
+```
+
+### 12.5（可选）Lua 原子配对脚本
+
+为避免并发 Worker 各取一个玩家导致卡住，用 Lua 将“取两人 + 建房”打包为原子操作：
+
+```lua
+-- KEYS[1] = queueKey
+-- KEYS[2] = roomKeyPrefix (如 'mm:room:')
+-- ARGV[1] = roomId
+
+local a = redis.call('RPOP', KEYS[1])
+if not a then return { 'empty' } end
+local b = redis.call('RPOP', KEYS[1])
+if not b then
+  redis.call('RPUSH', KEYS[1], a) -- 放回，保持队列完整
+  return { 'single' }
+end
+redis.call('HSET', KEYS[2] .. ARGV[1], 'a', a, 'b', b)
+return { 'paired', a, b }
+```
+
+Node 侧调用示例：
+
+```javascript
+const roomId = crypto.randomUUID();
+const script = '...上面的脚本...';
+const r = await redis.eval(script, { keys: ['mm:queue', 'mm:room:'], arguments: [roomId] });
+if (r[1] === 'paired') { /* 成功配对 */ }
+```
+
+#### 12.5.A Lua 基础速览（看这一节就能读懂脚本）
+
+- Redis 的 Lua 脚本是“在 Redis 服务器里执行的一段小程序”，一次脚本执行期间是原子的（不会被其他命令插队）。
+- 脚本入口拿到两个数组：
+  - `KEYS`：键名列表（由调用方传入）
+  - `ARGV`：普通参数列表（由调用方传入）
+- 通过 `redis.call('<命令>', 参数...)` 调用 Redis 命令，返回值是 Lua 的字符串/数字/表（数组）。
+
+脚本关键点对照：
+
+- `local a = redis.call('RPOP', KEYS[1])`
+  - 从队列尾部弹出一个元素（玩家 A）。如果队列空，返回 nil。
+- `if not a then return { 'empty' } end`
+  - 如果队列本来就空，直接返回 `{'empty'}`。
+- `local b = redis.call('RPOP', KEYS[1])`
+  - 再取一个（玩家 B）。
+- `if not b then redis.call('RPUSH', KEYS[1], a) return { 'single' } end`
+  - 如果只取到一个，则把 A 放回队列尾，返回 `{'single'}`，保证不丢玩家。
+- `redis.call('HSET', KEYS[2] .. ARGV[1], 'a', a, 'b', b)`
+  - 在 `room:{roomId}` Hash 里写入 a、b 两个字段，建立房间。
+- `return { 'paired', a, b }`
+  - 返回配对成功以及两名玩家的 ID。
+
+把以上动作放在一个脚本里执行，就实现了“取两人 + 建房”的原子性：要么都成功，要么都失败。
+
+#### 12.5.B Node 调用 Lua 的两种方式
+
+1) 直接 eval（简单入门）
+
+```javascript
+const lua = `...脚本源码...`;
+const result = await redis.eval(lua, { keys: ['mm:queue', 'mm:room:'], arguments: [roomId] });
+```
+
+2) 预加载 + 按 SHA 调用（生产推荐，省流量/更快）
+
+```javascript
+const fs = require('fs');
+const path = require('path');
+let sha;
+async function getSha() {
+  if (!sha) {
+    const script = fs.readFileSync(path.join(__dirname, '../scripts/match_pair.lua'), 'utf8');
+    sha = await redis.scriptLoad(script);  // 缓存脚本
+  }
+  return sha;
+}
+
+async function runPair(roomId) {
+  const s = await getSha();
+  return await redis.evalSha(s, { keys: ['mm:queue', 'mm:room:'], arguments: [roomId] });
+}
+```
+
+返回值解读：
+
+- `['empty']`：队列为空，无人可配
+- `['single']`：只取到 1 人，已放回队列，稍后重试
+- `['paired', 'alice', 'bob']`：成功配对
+
+#### 12.5.C 常见坑与对策
+
+- 脚本路径/编码：读取文件请用 `utf8`，确保脚本完整；路径用 `path.join(__dirname, ...)`。
+- 键名前缀：`KEYS[2] .. ARGV[1]` 是字符串拼接，确保 `KEYS[2]` 末尾带冒号（如 `mm:room:`）。
+- 多实例 Worker：用本脚本即可并发安全；不要再混用阻塞式 BRPOP + 本脚本，避免语义冲突。
+- 调试：可用 `redis-cli --ldb --eval script.lua queue room: , <roomId>` 逐步调试（了解即可）。
+
+#### 12.5.D 最小可测试用例（不跑 Node 也能测）
+
+```bash
+# 假设 redis-cli 已安装
+redis-cli del mm:queue
+redis-cli lpush mm:queue alice bob
+
+# 执行脚本（本地文件路径根据实际调整）
+redis-cli --eval src/scripts/match_pair.lua mm:queue mm:room: , test-room-1
+
+# 期望：返回 (array) [1] "paired" [2] "bob" [3] "alice"
+redis-cli hgetall mm:room:test-room-1
+```
+#### 12.5.1 工程落地：脚本存放与加载
+
+目录与文件：
+
+- 放置 Lua 脚本：`src/scripts/match_pair.lua`
+- 在服务层加载并封装：`src/services/matchmaking.js`
+
+Lua 文件内容（与上文一致，便于直接落盘）：
+
+```lua
+-- src/scripts/match_pair.lua
+-- KEYS[1] = queueKey
+-- KEYS[2] = roomKeyPrefix (如 'mm:room:')
+-- ARGV[1] = roomId
+
+local a = redis.call('RPOP', KEYS[1])
+if not a then return { 'empty' } end
+local b = redis.call('RPOP', KEYS[1])
+if not b then
+  redis.call('RPUSH', KEYS[1], a)
+  return { 'single' }
+end
+redis.call('HSET', KEYS[2] .. ARGV[1], 'a', a, 'b', b)
+return { 'paired', a, b }
+```
+
+服务层封装（使用 `SCRIPT LOAD` + `EVALSHA`，并提供轮询封装）：
+
+```javascript
+// src/services/matchmaking.js（节选）
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { redis } = require('../config/redis');
+
+const QUEUE_KEY = 'mm:queue';
+const ROOM_PREFIX = 'mm:room:';
+
+let pairScriptSha;
+async function getPairScriptSha() {
+  if (!pairScriptSha) {
+    const lua = fs.readFileSync(path.join(__dirname, '../scripts/match_pair.lua'), 'utf8');
+    pairScriptSha = await redis.scriptLoad(lua);
+  }
+  return pairScriptSha;
+}
+
+async function takePairAndCreateRoomAtomic() {
+  const sha = await getPairScriptSha();
+  const roomId = crypto.randomUUID();
+  const r = await redis.evalSha(sha, { keys: [QUEUE_KEY, ROOM_PREFIX], arguments: [roomId] });
+  if (r[1] === 'paired') return { roomId, players: [r[2], r[3]] };
+  return null; // 'single' 或 'empty'
+}
+
+module.exports = { takePairAndCreateRoomAtomic };
+```
+
+Worker 使用（当返回 null 时短暂休眠再重试）：
+
+```javascript
+// src/index.js（节选）
+const { takePairAndCreateRoomAtomic } = require('./services/matchmaking');
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+(async function startWorker() {
+  while (true) {
+    try {
+      const res = await takePairAndCreateRoomAtomic();
+      if (!res) { await sleep(200); continue; }
+      console.log('[matchmaking] paired:', res.roomId, res.players);
+    } catch (e) {
+      console.error('[matchmaking] worker error:', e);
+      await sleep(500);
+    }
+  }
+})();
+```
+
+提示：使用 Lua 方案时，已不需要阻塞式 `BRPOP` 的独立连接；上面的脚本采用 `RPOP`，Worker 以短轮询方式调用，逻辑更直观，且可平滑扩展为多实例。
+
+### 12.6 面试要点
+
+- 为什么用 List 而非内存数组？多实例共享，支持阻塞消费（BRPOP）。
+- 与 Streams 对比：Streams 有消费组/ACK，适合复杂流水线；List 更轻量、心智负担小。
+- 并发安全：单 Worker 或 Lua 原子脚本，避免“各取一人”的竞争问题。
+- 容错与去重：Worker 异常可重启；可用 Set 做入队去重，再 LPUSH；或由业务容忍重复。
+
