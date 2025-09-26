@@ -710,128 +710,249 @@ curl http://localhost:3000/api/leaderboard/rank/alice
 - 面试题：为什么选择 ZSET？复杂度如何？
   - 有序集合按分数排序，插入和更新 O(log N)，取 TopN 与 Rank 查询非常高效。
 
----
 
-## 第7章：输入校验与错误处理（简化版）
+## 第6章补充：实现猜拳小游戏（Rock-Paper-Scissors）
 
-目标：保证接口收到的数据是可用的，并在出错时提供稳定的错误格式。
+目标：在不引入复杂重构之前，新增一个最小可用的“猜拳”游戏逻辑与接口，演示如何将纯业务规则落在服务层，并通过路由层对外提供 API。
 
-建议：
+约定：
 
-- 在路由层对 body/query/path 进行类型与必填校验（目前已做基础判断）
-- 返回统一结构：`{ error: string, details?: any }`
-- 记录错误日志，避免把内部错误信息直接暴露给客户端
+- 手势编码：0=石头、1=剪子、2=布
+- 判定规则：石头胜剪子；剪子胜布；布胜石头；相同为平局
 
-可选升级：引入 `zod` 或 `joi` 做可复用的 schema 校验，在服务层前就拦截无效输入。
-
-面试点：
-
-- 如何设计错误码与 HTTP 状态码的对应关系？
-- 校验失败与系统异常应如何区分？
-
----
-
-## 第8章：日志与配置
-
-目标：结构化日志与可切换的配置管理。
-
-建议：
-
-- 使用 `.env` 管理敏感与可变配置
-- 日志工具可以选 `pino`（高性能）、或 `morgan`（HTTP 访问日志）
-
-示例（简化）：
-
-```bash
-npm install pino morgan
-```
-
-`src/utils/logger.js`
+### 服务层：`src/services/rps.js`
 
 ```javascript
-const pino = require('pino');
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
-module.exports = logger;
+// 纯函数：只依赖参数、无副作用，便于单元测试与复用
+function evaluateRps(moveA, moveB) {
+  const valid = [0, 1, 2];
+  if (!valid.includes(moveA) || !valid.includes(moveB)) {
+    throw new Error('invalid move: expected 0|1|2');
+  }
+
+  const names = ['rock', 'scissors', 'paper'];
+  const diff = (moveA - moveB + 3) % 3; // 0 平局，2 A 胜，1 B 胜（基于 0=石头 1=剪子 2=布）
+
+  if (diff === 0) {
+    return { result: 'draw', winner: null, reason: `${names[moveA]} == ${names[moveB]}` };
+  }
+  if (diff === 2) {
+    return { result: 'A', winner: 'A', reason: `${names[moveA]} beats ${names[moveB]}` };
+  }
+  return { result: 'B', winner: 'B', reason: `${names[moveB]} beats ${names[moveA]}` };
+}
+
+module.exports = { evaluateRps };
 ```
 
-在 `src/index.js` 中引入并打印启动信息，路由中记录关键操作。
+### 路由层：`src/routes/rps.js`
 
-面试点：
+```javascript
+const express = require('express');
+const { evaluateRps } = require('../services/rps');
 
-- 生产环境日志与本地开发日志的差异（JSON vs pretty print）
-- 如何通过环境变量切换日志等级
+const router = express.Router();
 
----
+// 单局对战判定
+router.post('/duel', (req, res) => {
+  const { playerA, playerB, moveA, moveB } = req.body || {};
+  if (!playerA || !playerB) return res.status(400).json({ error: 'playerA and playerB required' });
+  const a = Number(moveA), b = Number(moveB);
+  if (!Number.isInteger(a) || !Number.isInteger(b)) return res.status(400).json({ error: 'moveA/moveB must be integer 0|1|2' });
+  try {
+    const verdict = evaluateRps(a, b);
+    const winnerId = verdict.winner === 'A' ? playerA : verdict.winner === 'B' ? playerB : null;
+    return res.status(200).json({ ...verdict, playerA, playerB, winnerId });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
 
-## 第9章：Docker 化与一键启动
+module.exports = router;
+```
 
-目标：一条命令拉起服务与 Redis，方便评审者快速体验。
+### 汇总路由入口 `src/routes/index.js`
 
-最小示例（将在后续实现）：
+```javascript
+const express = require('express');
+const matchmaking = require('./matchmaking');
+const leaderboard = require('./leaderboard');
+const rps = require('./rps');
 
-- `Dockerfile`：构建 Node.js 应用镜像
-- `docker-compose.yml`：同时启动 app 与 redis，并通过环境变量注入连接地址
+const router = express.Router();
 
-面试点：
+router.use('/matchmaking', matchmaking);
+router.use('/leaderboard', leaderboard);
+router.use('/rps', rps);
 
-- 容器内服务如何与另一个容器（Redis）通信？
-- 多阶段构建如何减小镜像体积？
+module.exports = router;
+```
 
----
+将上述三行引入与 `router.use('/rps', rps);` 插入到现有路由聚合文件中（放在其他路由之后、`module.exports` 之前）。
 
-## 第10章：API 文档与测试
+### 运行与验证（示例）
 
-目标：提供最基本的 API 说明与用例脚本；可选增加 Jest 自动化测试。
+```bash
+# 单局对战：A=石头(0) vs B=剪子(1) → A 胜
+curl -X POST http://localhost:3000/api/rps/duel \
+  -H "Content-Type: application/json" \
+  -d '{"playerA":"alice","playerB":"bob","moveA":0,"moveB":1}'
 
-建议：
+# 平局：A=布(2) vs B=布(2)
+curl -X POST http://localhost:3000/api/rps/duel \
+  -H "Content-Type: application/json" \
+  -d '{"playerA":"alice","playerB":"bob","moveA":2,"moveB":2}'
+```
 
-- 在 README 中维护“如何运行”“如何调用”的示例（你现在看到的这些 curl 就是）
-- 可选：使用 Swagger/OpenAPI 生成可视化文档
+### 本章小结与面试点
 
-面试点：
-
-- 如何在 CI 中执行测试并出报告？
-- 如何为外部用户提供稳定的 API 版本？
-
----
-
-## 第11章：部署与展示（GitHub Actions 可选）
-
-目标：让你的仓库“看起来专业、能跑起来”。
-
-建议：
-
-- 在 README 顶部放置运行截图、接口示例、技术要点
-- 使用 GitHub Actions：在 push 时自动 `npm ci && npm test && docker build`（可选）
-- 提供一键部署脚本或 Render/Heroku 的免费部署指南（如适用）
-
----
-
-## 附录A：常见问题与排错清单
-
-- 服务启动报端口被占用：修改 `PORT` 或关闭占用端口的进程
-- Redis 连接失败：检查 `REDIS_URL`、网络、防火墙，尝试 `docker ps` 确认容器已启动
-- curl 显示无法连接：确认服务已启动且监听 `http://localhost:3000`
-
----
-
-## 附录B：面试题速查（汇总）
-
-- 为什么排行榜适合用 Redis 的 Sorted Set？复杂度与常见操作？
-- 多实例服务如何做匹配一致性？（共享队列、分布式锁、队列/流、单点匹配器）
-- 如何防止恶意刷分？（鉴权、服务端校验、限流、异常检测）
-- 如何保证排行榜的原子性更新？（单条命令、Lua 脚本、事务）
-- 如何做可观测性？（结构化日志、指标、追踪）
+- 你把业务规则封装为纯函数，接口层只做输入校验与组装返回
+- 模 3 判定技巧：`(a - b + 3) % 3` 映射为平局/胜负，常数时间、无分支表更清晰
+- 可扩展方向：三局两胜、积分结算、结合匹配服务生成对局并写入排行榜
 
 ---
 
-## 下一步（你现在可以做什么）
+## 第6章进阶：按房间出招与更新排行榜（对战流程）
 
-1) 按照第2–6章完成代码与本地验证，并提交到 GitHub（在提交信息中体现你的学习路径）
-2) 选择第9章 Docker 化，让评审者“一键可运行”
-3) 在仓库 README 顶部补充：项目截图、快速开始、API 示例与技术要点清单
-4) 如需加分：把服务改写为 TypeScript（保留相同结构），或将匹配队列迁移到 Redis 以支持多实例
+目标：把第6章补充的“一次性判定”升级为“匹配成功后按房间进行对战”：
 
-> 提醒：本教材采用“引导—实现—总结—面试点”的节奏。你可以逐章提交，每次提交都能在面试中讲述“我为什么这样做”。
+- 玩家通过匹配拿到 `roomId`
+- 两位玩家分别提交各自的出招
+- 当两人都出招后立即判定胜负并为获胜者加 1 分到排行榜
+- 任意时刻可查询房间的对战状态（pending/resolved）
 
+本章仍然以内存状态演示（适合单实例开发），第9章再讲如何迁移到 Redis（适合分布式）。
 
+### 1. 设计与约定
+
+- 状态容器：在服务层维护一个 `roomStates`（Map）。
+- 状态结构：
+  ```js
+  roomId -> {
+    players: [playerAId, playerBId],
+    moves: { [playerId]: 0|1|2 },
+    result: { result: 'A'|'B'|'draw', winner: 'A'|'B'|null, reason, playerA, playerB, winnerId } | null
+  }
+  ```
+- 判定复用上一章的 `evaluateRps(a, b)`。
+- 加分调用排行榜服务的 `addScore(winnerId, 1)`。
+
+### 2. 服务层：新增交互函数（在 `src/services/rps.js`）
+
+在文件顶部引入排行榜与匹配查询函数，并新增内存状态与两个方法：
+
+```javascript
+const { addScore } = require('./leaderboard');
+const { getMatch } = require('./matchmaking');
+
+const roomStates = new Map(); // 内存态，单实例即可
+
+function evaluateRps(moveA, moveB) { /* 已有：保持不变 */ }
+
+async function submitMove(roomId, playerId, move) {
+  // 1) 校验参数与房间归属
+  // 2) 记录玩家出招
+  // 3) 若两人都已出招且尚未判定：evaluateRps → 生成 winnerId → addScore(winnerId, 1)
+  // 4) 返回 { status: 'resolved', ...result } 或 { status: 'pending', waitingFor: [...] }
+}
+
+function getResult(roomId) {
+  // 返回房间当前状态：resolved（带胜负）或 pending（带待出招方）
+}
+
+module.exports = { evaluateRps, submitMove, getResult };
+```
+
+实现提示：
+
+- 使用 `getMatch(roomId)` 拿到 `[aId, bId]`；非房间成员提交时返回错误。
+- `moves[playerId] = Number(move)`；待两人都存在时再判定。
+- `winnerId` 由 `winner==='A' ? aId : winner==='B' ? bId : null` 得出；平局不加分。
+
+#### 状态初始化策略（重要）
+
+`roomStates` 与匹配模块中的 `activeMatches` 是两个不同的容器：
+
+- `activeMatches` 只负责“匹配结果”（`roomId -> [aId, bId]`）
+- `roomStates` 负责“对战状态”（`players/moves/result`）
+
+要保证 `roomStates.get(roomId)` 能取到值，需要在对战流程中进行初始化：
+
+- 懒创建（推荐）：在第一次 `submitMove` 时，先通过 `getMatch(roomId)` 拿到 `[aId,bId]`，若 `roomStates` 中没有就创建：
+
+  ```javascript
+  const players = getMatch(roomId);
+  if (!players) throw new Error('room_not_found');
+  const [aId, bId] = players;
+  const state = roomStates.get(roomId) || { players: [aId, bId], moves: {}, result: null };
+  // 写入出招与后续判定...
+  roomStates.set(roomId, state);
+  ```
+
+- 预创建：在匹配成功返回 `roomId` 时（`joinQueue` 成功匹配处），调用一个 `initRoom(roomId, [aId,bId])` 方法写入 `roomStates`。这种方式更显式，但需要跨模块调用一次初始化。
+
+### 3. 路由层：提交出招与查询结果（在 `src/routes/rps.js`）
+
+在现有 `router` 下新增两个接口：
+
+```javascript
+// 提交出招
+router.post('/submit-move', async (req, res) => {
+  const { roomId, playerId, move } = req.body || {};
+  if (!roomId || !playerId) return res.status(400).json({ error: 'roomId and playerId required' });
+  try {
+    const r = await submitMove(roomId, playerId, move);
+    return res.status(200).json(r);
+  } catch (err) {
+    const message = err?.message || 'submit_move_failed';
+    const status = message === 'room_not_found' || message === 'player_not_in_room' ? 404 : 400;
+    return res.status(status).json({ error: message });
+  }
+});
+
+// 查询结果
+router.get('/result/:roomId', (req, res) => {
+  const r = getResult(req.params.roomId);
+  if (!r) return res.status(404).json({ error: 'room_not_found' });
+  return res.status(200).json(r);
+});
+```
+
+### 4. 运行与验证
+
+1) 先通过匹配接口获取 `roomId`：
+
+```bash
+curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"alice"}'
+curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"bob"}'
+# 返回 { status: "matched", roomId, players: ["alice","bob"] }
+```
+
+2) 双方提交出招：
+
+```bash
+curl -X POST http://localhost:3000/api/rps/submit-move -H "Content-Type: application/json" -d '{"roomId":"<roomId>","playerId":"alice","move":0}'
+curl -X POST http://localhost:3000/api/rps/submit-move -H "Content-Type: application/json" -d '{"roomId":"<roomId>","playerId":"bob","move":1}'
+```
+
+3) 查询结果（也可在第二次提交时直接返回 resolved）：
+
+```bash
+curl http://localhost:3000/api/rps/result/<roomId>
+```
+
+4) 查看排行榜是否加分：
+
+```bash
+curl "http://localhost:3000/api/leaderboard/top?n=10"
+```
+
+### 5. 面试点与扩展
+
+- 为什么先用内存 Map？单实例开发简单直观；多副本需要迁移到 Redis。
+- 如何迁移到 Redis？
+  - 房间状态用 Hash（或 RedisJSON）；出招可用 HSET 或单独键；
+  - 对战完成后使用 Lua 脚本原子判定与加分，避免并发竞态。
+- 幂等与重入：重复提交出招时是否允许覆盖？建议在本章容忍覆盖，生产用版本通过版本号或 Lua 保证一次性。
+
+---
