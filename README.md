@@ -1,6 +1,6 @@
 ## Node.js 游戏匹配与 Redis 排行榜：从零到一的简历加分项目
 
-本教材带你从空目录开始，手把手搭建一个“可以运行、可展示、可讲述”的 Node.js 游戏后端：包含玩家匹配服务与基于 Redis 的排行榜。你将按章节循序渐进，每一步都知道“在做什么”“为什么这么做”，并附上面试官常问的问题与答题要点。
+本教材带你从空目录开始，手把手搭建一个"可以运行、可展示、可讲述"的 Node.js 游戏后端：包含玩家匹配服务与基于 Redis 的排行榜。你将按章节循序渐进，每一步都知道"在做什么""为什么这么做"，并附上面试官常问的问题与答题要点。
 
 面向读者：后端入门者、转岗同学、需要一个拿得出手的 GitHub 项目的人。
 
@@ -20,7 +20,7 @@
 - Redis 提供高性能数据结构（比如 Sorted Set）非常适合排行榜场景
 - 架构思路通用：未来可迁移到 TypeScript 或 Go、Rust 等语言
 
-> 说明：你先前提到“Node.js 服务端”，后文也会坚持使用 Node.js。如果你改为希望使用 Go，同样的章节结构可平移过去（我会在后续章节的“可选拓展”里提示 TS/Go 的迁移点）。
+> 说明：你先前提到"Node.js 服务端"，后文也会坚持使用 Node.js。如果你改为希望使用 Go，同样的章节结构可平移过去（我会在后续章节的"可选拓展"里提示 TS/Go 的迁移点）。
 
 ---
 
@@ -92,7 +92,7 @@ git --version
 
 ## 第1章：创建与初始化仓库（本地与 GitHub）
 
-目标：从空目录开始，建立 Git 仓库与 npm 项目，并推送到 GitHub，形成“可展示”的基础。
+目标：从空目录开始，建立 Git 仓库与 npm 项目，并推送到 GitHub，形成"可展示"的基础。
 
 > 你的工作目录：`E:\IFile\nodeFile\PairAndRank`（已存在）。
 
@@ -175,7 +175,7 @@ gh repo create PairAndRank --public --source=. --remote=origin --push
 
 ### 本章小结与面试点
 
-- 你已经拥有一个“可推送、可展示”的最小仓库
+- 你已经拥有一个"可推送、可展示"的最小仓库
 - 面试官可能问：`package.json` 里最重要的字段有哪些？
   - name/version/scripts/dependencies 等；scripts 在团队协作中非常关键。
 
@@ -450,7 +450,7 @@ git push
 目标：
 
 - 提供 API：玩家入队、离队、查看队列长度
-- 当队列中人数达到 2，即刻两两配对并返回一个“房间号”（示例用随机 UUID）
+- 当队列中人数达到 2，即刻两两配对并返回一个"房间号"（示例用随机 UUID）
 - 先使用内存队列实现（简单直观）；第9章提供用 Redis 列表/流扩展为分布式的思路
 
 ### 5.1 服务层：`src/services/matchmaking.js`
@@ -713,7 +713,7 @@ curl http://localhost:3000/api/leaderboard/rank/alice
 
 ## 第6章补充：实现猜拳小游戏（Rock-Paper-Scissors）
 
-目标：在不引入复杂重构之前，新增一个最小可用的“猜拳”游戏逻辑与接口，演示如何将纯业务规则落在服务层，并通过路由层对外提供 API。
+目标：在不引入复杂重构之前，新增一个最小可用的"猜拳"游戏逻辑与接口，演示如何将纯业务规则落在服务层，并通过路由层对外提供 API。
 
 约定：
 
@@ -812,154 +812,131 @@ curl -X POST http://localhost:3000/api/rps/duel \
 
 ---
 
-## 第6章进阶：按房间出招与更新排行榜（对战流程）
+## 第6章进阶：按房间出招与更新排行榜（对战流程，Redis 存储版）
 
-目标：把第6章补充的“一次性判定”升级为“匹配成功后按房间进行对战”：
+目标：把"一次性判定"升级为"按房间进行对战"，并将出招/结果全部存入 Redis，便于多实例可见与自动过期。
 
 - 玩家通过匹配拿到 `roomId`
 - 两位玩家分别提交各自的出招
 - 当两人都出招后立即判定胜负并为获胜者加 1 分到排行榜
 - 任意时刻可查询房间的对战状态（pending/resolved）
 
-本章仍然以内存状态演示（适合单实例开发），第9章再讲如何迁移到 Redis（适合分布式）。
+本章直接使用 Redis Hash 存储对战状态（生产友好）：
 
 ### 1. 设计与约定
 
-- 状态容器：在服务层维护一个 `roomStates`（Map）。
-- 状态结构：
-  ```js
-  roomId -> {
-    players: [playerAId, playerBId],
-    moves: { [playerId]: 0|1|2 },
-    result: { result: 'A'|'B'|'draw', winner: 'A'|'B'|null, reason, playerA, playerB, winnerId } | null
-  }
-  ```
-- 判定复用上一章的 `evaluateRps(a, b)`。
-- 加分调用排行榜服务的 `addScore(winnerId, 1)`。
+- 状态容器：`mm:room:<roomId>`（Hash）
+- 字段约定：
+  - `a`、`b`：两名玩家 ID（由配对脚本写入）
+  - `moves`：JSON 字符串，形如 `{ "alice":0, "bob":2 }`
+  - `result`、`winner`、`reason`、`winnerId`：判定完成后写入
+- TTL 规则（分阶段）：
+  - 新建房间：TTL=60 秒（见 12.5 脚本中的 `EXPIRE roomKey 60`）
+  - 分出胜负：将 TTL 延长为 3600 秒（便于短期审计/回放）
+- 判定复用上一章的 `evaluateRps(a, b)`；加分使用 `addScore(winnerId, 1)`。
 
-### 2. 服务层：新增交互函数（在 `src/services/rps.js`）
+### 2. 服务层：提交出招与查询结果（在 `src/services/rps.js`）
 
-在文件顶部引入排行榜与匹配查询函数，并新增内存状态与两个方法：
+仅展示关键片段（其余保持不变）：
 
 ```javascript
 const { addScore } = require('./leaderboard');
-const { getMatch } = require('./matchmaking');
+const { getMatch } = require('./matchmaking'); // 读取 a/b（底层已从 Redis Hash 取）
+const { redis } = require('../config/redis');
 
-const roomStates = new Map(); // 内存态，单实例即可
+function evaluateRps(moveA, moveB) { /* 同上章：纯函数，略 */ }
 
-function evaluateRps(moveA, moveB) { /* 已有：保持不变 */ }
-
+// 提交出招
 async function submitMove(roomId, playerId, move) {
-  // 1) 校验参数与房间归属
-  // 2) 记录玩家出招
-  // 3) 若两人都已出招且尚未判定：evaluateRps → 生成 winnerId → addScore(winnerId, 1)
-  // 4) 返回 { status: 'resolved', ...result } 或 { status: 'pending', waitingFor: [...] }
+  const match = await getMatch(roomId);
+  if (!match) throw new Error('room_not_found');
+  const [aId, bId] = match;
+  if (playerId !== aId && playerId !== bId) throw new Error('player_not_in_room');
+
+  const m = Number(move);
+  if (!Number.isInteger(m) || m < 0 || m > 2) throw new Error('invalid_move');
+
+  const roomKey = `mm:room:${roomId}`;
+  const data = await redis.hGetAll(roomKey);
+  const moves = data.moves ? JSON.parse(data.moves) : {};
+  if (Object.prototype.hasOwnProperty.call(moves, playerId)) {
+    throw new Error('player_already_moved');
+  }
+  moves[playerId] = m;
+
+  let status = 'pending';
+  let resultPayload = {};
+  if (Object.keys(moves).length === 2 && !data.result) {
+    const { result, winner, reason } = evaluateRps(moves[aId], moves[bId]);
+    const winnerId = winner === 'A' ? aId : winner === 'B' ? bId : null;
+    if (winnerId) await addScore(winnerId, 1);
+    resultPayload = { result, winner, reason, winnerId: winnerId || '' };
+    status = 'resolved';
+  }
+
+  // 写回 Redis（moves 序列化；若有结果一并写入），并设置 TTL
+  await redis.hSet(roomKey, {
+    a: aId,
+    b: bId,
+    moves: JSON.stringify(moves),
+    ...resultPayload,
+  });
+  await redis.expire(roomKey, status === 'resolved' ? 3600 : 60);
+
+  return status === 'resolved'
+    ? { status: 'resolved', ...resultPayload, playerA: aId, playerB: bId }
+    : { status: 'pending', waitingFor: [aId, bId].filter(id => !(id in moves)) };
 }
 
-function getResult(roomId) {
-  // 返回房间当前状态：resolved（带胜负）或 pending（带待出招方）
+// 查询结果（从 Redis 读取）
+async function getResult(roomId) {
+  const data = await redis.hGetAll(`mm:room:${roomId}`);
+  if (!data || (!data.a && !data.b)) return null;
+  const players = [data.a, data.b];
+  const moves = data.moves ? JSON.parse(data.moves) : {};
+  if (data.result) {
+    return {
+      players,
+      moves,
+      result: {
+        result: data.result,
+        winner: data.winner || null,
+        reason: data.reason || '',
+        playerA: players[0],
+        playerB: players[1],
+        winnerId: data.winnerId || null,
+      },
+    };
+  }
+  return { players, moves, result: null };
 }
-
-module.exports = { evaluateRps, submitMove, getResult };
 ```
-
-实现提示：
-
-- 使用 `getMatch(roomId)` 拿到 `[aId, bId]`；非房间成员提交时返回错误。
-- `moves[playerId] = Number(move)`；待两人都存在时再判定。
-- `winnerId` 由 `winner==='A' ? aId : winner==='B' ? bId : null` 得出；平局不加分。
-
-#### 状态初始化策略（重要）
-
-`roomStates` 与匹配模块中的 `activeMatches` 是两个不同的容器：
-
-- `activeMatches` 只负责“匹配结果”（`roomId -> [aId, bId]`）
-- `roomStates` 负责“对战状态”（`players/moves/result`）
-
-要保证 `roomStates.get(roomId)` 能取到值，需要在对战流程中进行初始化：
-
-- 懒创建（推荐）：在第一次 `submitMove` 时，先通过 `getMatch(roomId)` 拿到 `[aId,bId]`，若 `roomStates` 中没有就创建：
-
-  ```javascript
-  const players = getMatch(roomId);
-  if (!players) throw new Error('room_not_found');
-  const [aId, bId] = players;
-  const state = roomStates.get(roomId) || { players: [aId, bId], moves: {}, result: null };
-  // 写入出招与后续判定...
-  roomStates.set(roomId, state);
-  ```
-
-- 预创建：在匹配成功返回 `roomId` 时（`joinQueue` 成功匹配处），调用一个 `initRoom(roomId, [aId,bId])` 方法写入 `roomStates`。这种方式更显式，但需要跨模块调用一次初始化。
 
 ### 3. 路由层：提交出招与查询结果（在 `src/routes/rps.js`）
 
-在现有 `router` 下新增两个接口：
+仅展示结果查询的异步版本（提交出招保持不变）：
 
 ```javascript
-// 提交出招
-router.post('/submit-move', async (req, res) => {
-  const { roomId, playerId, move } = req.body || {};
-  if (!roomId || !playerId) return res.status(400).json({ error: 'roomId and playerId required' });
+router.get('/result/:roomId', async (req, res) => {
   try {
-    const r = await submitMove(roomId, playerId, move);
+    const r = await getResult(req.params.roomId);
+    if (!r) return res.status(404).json({ error: 'room_not_found' });
     return res.status(200).json(r);
   } catch (err) {
-    const message = err?.message || 'submit_move_failed';
-    const status = message === 'room_not_found' || message === 'player_not_in_room' ? 404 : 400;
-    return res.status(status).json({ error: message });
+    return res.status(500).json({ error: err?.message || 'result_query_failed' });
   }
 });
-
-// 查询结果
-router.get('/result/:roomId', (req, res) => {
-  const r = getResult(req.params.roomId);
-  if (!r) return res.status(404).json({ error: 'room_not_found' });
-  return res.status(200).json(r);
-});
 ```
 
-### 4. 运行与验证
+### 4. 并发与原子性（可选，生产建议）
 
-1) 先通过匹配接口获取 `roomId`：
-
-```bash
-curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"alice"}'
-curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: application/json" -d '{"playerId":"bob"}'
-# 返回 { status: "matched", roomId, players: ["alice","bob"] }
-```
-
-2) 双方提交出招：
-
-```bash
-curl -X POST http://localhost:3000/api/rps/submit-move -H "Content-Type: application/json" -d '{"roomId":"<roomId>","playerId":"alice","move":0}'
-curl -X POST http://localhost:3000/api/rps/submit-move -H "Content-Type: application/json" -d '{"roomId":"<roomId>","playerId":"bob","move":1}'
-```
-
-3) 查询结果（也可在第二次提交时直接返回 resolved）：
-
-```bash
-curl http://localhost:3000/api/rps/result/<roomId>
-```
-
-4) 查看排行榜是否加分：
-
-```bash
-curl "http://localhost:3000/api/leaderboard/top?n=10"
-```
-
-### 5. 面试点与扩展
-
-- 为什么先用内存 Map？单实例开发简单直观；多副本需要迁移到 Redis。
-- 如何迁移到 Redis？
-  - 房间状态用 Hash（或 RedisJSON）；出招可用 HSET 或单独键；
-  - 对战完成后使用 Lua 脚本原子判定与加分，避免并发竞态。
-- 幂等与重入：重复提交出招时是否允许覆盖？建议在本章容忍覆盖，生产用版本通过版本号或 Lua 保证一次性。
+为避免同时提交导致的竞态，可用 Lua 将"写出招 → 判定 → 计分 → 设置 TTL"打包为一次原子脚本（思路沿用 12.5 的写法）。演示项目可先使用上述直观实现，生产再切换为 Lua 原子版。
 
 ---
 
 ## 第12章：用 Redis List 实现匹配队列（分布式雏形）
 
-目标：将“内存队列”重构为 Redis List，使多个实例共享同一匹配队列，避免多副本不一致。
+目标：将"内存队列"重构为 Redis List，使多个实例共享同一匹配队列，避免多副本不一致。
 
 ### 12.1 键与队列设计
 
@@ -973,7 +950,7 @@ curl "http://localhost:3000/api/leaderboard/top?n=10"
 
 ### 12.2 服务层改造（保持对外 API 不变）
 
-将 `src/services/matchmaking.js` 从“内存数组 + Map”改为 Redis：
+将 `src/services/matchmaking.js` 从"内存数组 + Map"改为 Redis：
 
 ```javascript
 // src/services/matchmaking.js（重构要点：阻塞命令用独立连接）
@@ -1065,7 +1042,7 @@ curl -X POST http://localhost:3000/api/matchmaking/queue/join -H "Content-Type: 
 curl http://localhost:3000/api/matchmaking/match/<roomId>
 ```
 
-完成一次“猜拳”完整对战（拿到 roomId 后）：
+完成一次"猜拳"完整对战（拿到 roomId 后）：
 
 ```bash
 # 双方提交出招（0=石头 1=剪子 2=布）
@@ -1081,7 +1058,7 @@ curl "http://localhost:3000/api/leaderboard/top?n=10"
 
 ### 12.5（可选）Lua 原子配对脚本
 
-为避免并发 Worker 各取一个玩家导致卡住，用 Lua 将“取两人 + 建房”打包为原子操作：
+为避免并发 Worker 各取一个玩家导致卡住，用 Lua 将"取两人 + 建房"打包为原子操作：
 
 ```lua
 -- KEYS[1] = queueKey
@@ -1095,7 +1072,10 @@ if not b then
   redis.call('RPUSH', KEYS[1], a) -- 放回，保持队列完整
   return { 'single' }
 end
-redis.call('HSET', KEYS[2] .. ARGV[1], 'a', a, 'b', b)
+local roomKey = KEYS[2] .. ARGV[1]
+redis.call('HSET', roomKey, 'a', a)
+redis.call('HSET', roomKey, 'b', b)
+redis.call('EXPIRE', roomKey, 60) -- 新建房间：默认保留 60 秒
 return { 'paired', a, b }
 ```
 
@@ -1110,7 +1090,7 @@ if (r[1] === 'paired') { /* 成功配对 */ }
 
 #### 12.5.A Lua 基础速览（看这一节就能读懂脚本）
 
-- Redis 的 Lua 脚本是“在 Redis 服务器里执行的一段小程序”，一次脚本执行期间是原子的（不会被其他命令插队）。
+- Redis 的 Lua 脚本是"在 Redis 服务器里执行的一段小程序"，一次脚本执行期间是原子的（不会被其他命令插队）。
 - 脚本入口拿到两个数组：
   - `KEYS`：键名列表（由调用方传入）
   - `ARGV`：普通参数列表（由调用方传入）
@@ -1128,10 +1108,12 @@ if (r[1] === 'paired') { /* 成功配对 */ }
   - 如果只取到一个，则把 A 放回队列尾，返回 `{'single'}`，保证不丢玩家。
 - `redis.call('HSET', KEYS[2] .. ARGV[1], 'a', a, 'b', b)`
   - 在 `room:{roomId}` Hash 里写入 a、b 两个字段，建立房间。
+- `redis.call('EXPIRE', roomKey, 60)`
+  - 新建房间：默认保留 60 秒。
 - `return { 'paired', a, b }`
   - 返回配对成功以及两名玩家的 ID。
 
-把以上动作放在一个脚本里执行，就实现了“取两人 + 建房”的原子性：要么都成功，要么都失败。
+把以上动作放在一个脚本里执行，就实现了"取两人 + 建房"的原子性：要么都成功，要么都失败。
 
 #### 12.5.B Node 调用 Lua 的两种方式
 
@@ -1210,7 +1192,10 @@ if not b then
   redis.call('RPUSH', KEYS[1], a)
   return { 'single' }
 end
-redis.call('HSET', KEYS[2] .. ARGV[1], 'a', a, 'b', b)
+local roomKey = KEYS[2] .. ARGV[1]
+redis.call('HSET', roomKey, 'a', a)
+redis.call('HSET', roomKey, 'b', b)
+redis.call('EXPIRE', roomKey, 60) -- 新建房间：默认保留 60 秒
 return { 'paired', a, b }
 ```
 
@@ -1274,6 +1259,172 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 - 为什么用 List 而非内存数组？多实例共享，支持阻塞消费（BRPOP）。
 - 与 Streams 对比：Streams 有消费组/ACK，适合复杂流水线；List 更轻量、心智负担小。
-- 并发安全：单 Worker 或 Lua 原子脚本，避免“各取一人”的竞争问题。
+- 并发安全：单 Worker 或 Lua 原子脚本，避免"各取一人"的竞争问题。
 - 容错与去重：Worker 异常可重启；可用 Set 做入队去重，再 LPUSH；或由业务容忍重复。
 
+
+---
+
+## 第13章：Vue3 极简前端联调（猜拳 + 匹配 + 排行榜）
+
+目标：用最少代码跑通一个可演示的 Vue3 小页面，直接对接你现有的 Node.js API：匹配、提交出招、排行榜。
+
+### 13.1 创建最小 Vue3 项目（Vite）
+
+```bash
+# 在仓库同级目录创建前端项目
+npm create vue@latest pair-and-rank-ui -- --template vue
+cd pair-and-rank-ui
+npm install
+npm run dev  # 默认 http://localhost:5173
+```
+
+### 13.2 配置开发代理（避免跨域）
+在前端项目根目录创建或编辑 `vite.config.js`：
+
+```js
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
+  plugins: [vue()],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3000', // 后端服务地址
+        changeOrigin: true,
+      },
+    },
+  },
+})
+```
+
+说明：你的后端在 `src/index.js` 中将路由挂载在 `/api` 下：
+- 匹配：`POST /api/matchmaking/queue/join`、`POST /api/matchmaking/queue/leave`、`GET /api/matchmaking/queue/size`、`GET /api/matchmaking/match/:roomId`
+- 猜拳：`POST /api/rps/submit-move`、`GET /api/rps/result/:roomId`（以及演示用 `POST /api/rps/duel`）
+- 排行榜：`POST /api/leaderboard/submit`、`POST /api/leaderboard/add`、`GET /api/leaderboard/top?n=10`、`GET /api/leaderboard/rank/:playerId`
+
+### 13.3 最小页面（`src/App.vue`）
+将以下内容替换前端项目的 `src/App.vue`：
+
+```vue
+<script setup>
+import { ref, computed } from 'vue'
+
+const playerId = ref('')
+const roomId = ref('')
+const opponent = ref('')
+const statusMsg = ref('')
+const top = ref([])
+
+const canMatch = computed(() => !!playerId.value)
+
+async function joinQueue() {
+  statusMsg.value = '正在加入队列...'
+  const res = await fetch('/api/matchmaking/queue/join', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ playerId: playerId.value })
+  }).then(r => r.json())
+
+  if (res.status === 'matched') {
+    roomId.value = res.roomId
+    opponent.value = res.players.find(p => p !== playerId.value) || ''
+    statusMsg.value = `匹配成功，房间 ${roomId.value}，对手 ${opponent.value}`
+  } else if (res.status === 'queued') {
+    statusMsg.value = '已入队，等待另一位玩家...'
+  } else if (res.status === 'already_in_queue') {
+    statusMsg.value = '你已在队列中'
+  } else {
+    statusMsg.value = '匹配状态：' + (res.status || '未知')
+  }
+}
+
+async function leaveQueue() {
+  if (!playerId.value) return
+  await fetch('/api/matchmaking/queue/leave', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ playerId: playerId.value })
+  })
+  statusMsg.value = '已离开队列'
+}
+
+async function submitMove(move) {
+  if (!roomId.value || !playerId.value) return
+  statusMsg.value = '已出招，等待对手...'
+  const res = await fetch('/api/rps/submit-move', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roomId: roomId.value, playerId: playerId.value, move })
+  }).then(r => r.json())
+
+  if (res.status === 'resolved') {
+    statusMsg.value = `结果：${res.result}，胜者：${res.winnerId || '平局'}（${res.reason}）`
+    await refreshTop()
+  } else if (res.status === 'pending') {
+    statusMsg.value = '等待对手出招...'
+  } else if (res.error) {
+    statusMsg.value = '错误：' + res.error
+  }
+}
+
+async function refreshTop() {
+  const data = await fetch('/api/leaderboard/top?n=10').then(r => r.json())
+  top.value = data.top || []
+}
+
+// 进入页面时拉取一次排行榜
+refreshTop()
+</script>
+
+<template>
+  <main style="max-width:720px;margin:24px auto;font-family:system-ui,Segoe UI,Arial;">
+    <h1>Pair & Rank - 猜拳匹配演示</h1>
+
+    <section style="margin:16px 0;padding:12px;border:1px solid #eee;border-radius:8px;">
+      <h3>玩家</h3>
+      <input v-model="playerId" placeholder="输入玩家ID" style="padding:8px;margin-right:8px;" />
+      <button :disabled="!canMatch" @click="joinQueue">加入匹配</button>
+      <button :disabled="!canMatch" @click="leaveQueue" style="margin-left:8px">离开队列</button>
+      <p style="margin-top:8px;color:#555;">{{ statusMsg }}</p>
+      <p v-if="roomId">房间：{{ roomId }}；对手：{{ opponent || '未知（等待匹配/对方入场）' }}</p>
+    </section>
+
+    <section style="margin:16px 0;padding:12px;border:1px solid #eee;border-radius:8px;">
+      <h3>出招</h3>
+      <button :disabled="!roomId" @click="submitMove(0)">石头</button>
+      <button :disabled="!roomId" @click="submitMove(1)" style="margin-left:8px">剪子</button>
+      <button :disabled="!roomId" @click="submitMove(2)" style="margin-left:8px">布</button>
+    </section>
+
+    <section style="margin:16px 0;padding:12px;border:1px solid #eee;border-radius:8px;">
+      <h3>排行榜 Top 10</h3>
+      <ol>
+        <li v-for="p in top" :key="p.playerId">
+          第{{ p.rank }}：{{ p.playerId }}（{{ p.score }}）
+        </li>
+      </ol>
+    </section>
+  </main>
+</template>
+```
+
+### 13.4 启动与联调步骤
+1) 启动后端（3000）：
+```bash
+npm run dev
+```
+2) 启动前端（5173）：
+```bash
+cd ../pair-and-rank-ui
+npm run dev
+```
+3) 浏览器打开 `http://localhost:5173`：
+- 输入玩家ID（建议开两个浏览器窗口，分别输入不同 ID）
+- 点击"加入匹配"，匹配成功后会显示房间与对手
+- 双方分别点击"石头/剪子/布"，第二人出招后即刻结算，胜者自动加 1 分
+- 刷新"排行榜 Top 10"查看是否更新
+
+### 13.5 常见问题
+- 代理未生效：确认前端 `vite.config.js` 的 `/api` 代理与后端端口一致
+- 404/路径错误：比对本章"说明"中的接口路径是否与后端一致
+- Redis 未连接：检查后端 `.env` 中的 `REDIS_URL` 与控制台连接日志
+- CORS 报错：确保通过 Vite 代理访问（前端使用 `/api/...`

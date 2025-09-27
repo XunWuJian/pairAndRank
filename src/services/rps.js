@@ -1,6 +1,6 @@
 const { addScore } = require('./leaderboard');
 const { getMatch } = require('./matchmaking');
-
+const { redis } = require('../config/redis');
 const roomStates = new Map(); // 内存态，单实例即可
 
 
@@ -40,31 +40,74 @@ function evaluateRps(moveA, moveB) {
     const m = Number(move);
     if (!Number.isInteger(m) || m < 0 || m > 2) throw new Error('invalid_move');
     
-    const state = roomStates.get(roomId) || { players: [aId, bId], moves: {}, result: null };
+    const roomKey = `mm:room:${roomId}`;
+    const data = await redis.hGetAll(roomKey);
+    const moves = data.moves ? JSON.parse(data.moves) : {};
     
-    // 判重要判“是否存在该键”，避免 0 被当作 falsy
-    if (Object.prototype.hasOwnProperty.call(state.moves, playerId)) {
+    // 防重复出招
+    if (Object.prototype.hasOwnProperty.call(moves, playerId)) {
         throw new Error('player_already_moved');
     }
     
-    state.moves[playerId] = m;
-    // 2) 记录玩家出招
-    roomStates.set(roomId, state);
+    moves[playerId] = m;
+
+    let status = 'pending';
+    let resultPayload = null;
 
     // 3) 若两人都已出招且尚未判定：evaluateRps → 生成 winnerId → addScore(winnerId, 1)
-    if (Object.keys(state.moves).length === 2) {
-        const { result, winner, reason } = evaluateRps(state.moves[aId], state.moves[bId]);
+    if (Object.keys(moves).length === 2 && !data.result) {
+        const { result, winner, reason } = evaluateRps(Number(moves[aId]), Number(moves[bId]));
         const winnerId = winner === 'A' ? aId : winner === 'B' ? bId : null;
-        state.result = { result, winner, reason, playerA: aId, playerB: bId, winnerId };
-        addScore(winnerId, 1);
+        if (winnerId) {
+          await addScore(winnerId, 1);
+        }
+        resultPayload = { result, winner, reason, winnerId: winnerId || '' };
+        status = 'resolved';
     }
-    // 4) 返回 { status: 'resolved', ...result } 或 { status: 'pending', waitingFor: [...] }
-    return { status: 'resolved', ...state.result };
+
+    // 4) 将状态写回 Redis，并设置 TTL（未决60秒；已决3600秒）
+    await redis.hSet(roomKey, 'a', aId);
+    await redis.hSet(roomKey, 'b', bId);
+    await redis.hSet(roomKey, 'moves', JSON.stringify(moves));
+    if (resultPayload) {
+      await redis.hSet(roomKey, 'result', resultPayload.result);
+      await redis.hSet(roomKey, 'winner', resultPayload.winner || '');
+      await redis.hSet(roomKey, 'reason', resultPayload.reason || '');
+      await redis.hSet(roomKey, 'winnerId', resultPayload.winnerId || '');
+    }
+    await redis.expire(roomKey, status === 'resolved' ? 3600 : 60);
+
+    // 5) 返回状态
+    if (status === 'resolved') {
+      return { status: 'resolved', ...resultPayload, playerA: aId, playerB: bId };
+    }
+    const waitingFor = [aId, bId].filter(id => !(id in moves));
+    return { status: 'pending', waitingFor };
   }
   
-  function getResult(roomId) {
+  async function getResult(roomId) {
     // 返回房间当前状态：resolved（带胜负）或 pending（带待出招方）
-    return roomStates.get(roomId) || null;
+    const roomKey = `mm:room:${roomId}`;
+    const data = await redis.hGetAll(roomKey);
+    if (!data || (!data.a && !data.b)) return null;
+    const players = [data.a, data.b].filter(Boolean);
+    const moves = data.moves ? JSON.parse(data.moves) : {};
+
+    if (data.result) {
+      return {
+        players,
+        moves,
+        result: {
+          result: data.result,
+          winner: data.winner || null,
+          reason: data.reason || '',
+          playerA: players[0],
+          playerB: players[1],
+          winnerId: data.winnerId || null,
+        },
+      };
+    }
+    return { players, moves, result: null };
   }
-  
+
   module.exports = { evaluateRps, submitMove, getResult };

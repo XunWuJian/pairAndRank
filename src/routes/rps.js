@@ -32,11 +32,15 @@ router.post('/submit-move', async (req, res) => {
     }
   });
   
-  // 查询结果
-  router.get('/result/:roomId', (req, res) => {
-    const r = getResult(req.params.roomId);
-    if (!r) return res.status(404).json({ error: 'room_not_found' });
-    return res.status(200).json(r);
+  // 查询结果（异步）
+  router.get('/result/:roomId', async (req, res) => {
+    try {
+      const r = await getResult(req.params.roomId);
+      if (!r) return res.status(404).json({ error: 'room_not_found' });
+      return res.status(200).json(r);
+    } catch (err) {
+      return res.status(500).json({ error: err?.message || 'result_query_failed' });
+    }
   });
 
 module.exports = router;

@@ -25,11 +25,14 @@ async function addScore(playerId, delta) {
 
 /**
  * 获取分数最高的前 n 名（降序）。
+ * 兼容性写法：取末尾 n 个（升序末尾），再在内存中反转为降序。
  */
 async function topN(n = 10) {
   const limit = Number.isFinite(n) && n > 0 ? Math.floor(n) : 10;
-  const members = await redis.zRangeWithScores(LEADERBOARD_KEY, 0, limit - 1, { REV: true });
-  return members.map((m, idx) => ({ rank: idx + 1, playerId: m.value, score: m.score }));
+  // 取末尾 N 个（按分数升序的尾部）
+  const members = await redis.zRangeWithScores(LEADERBOARD_KEY, -limit, -1);
+  // 反转为按分数降序
+  return members.reverse().map((m, idx) => ({ rank: idx + 1, playerId: m.value, score: m.score }));
 }
 
 /**

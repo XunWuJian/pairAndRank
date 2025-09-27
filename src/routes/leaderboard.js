@@ -26,15 +26,23 @@ router.post('/add', async (req, res) => {
 });
 
 router.get('/top', async (req, res) => {
-  const n = Number(req.query.n || 10);
-  const list = await topN(n);
-  return res.status(200).json({ top: list });
+  try {
+    const n = Number(req.query.n || 10);
+    const list = await topN(n);
+    return res.status(200).json({ top: list });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'top_query_failed' });
+  }
 });
 
 router.get('/rank/:playerId', async (req, res) => {
-  const r = await rankOf(req.params.playerId);
-  if (!r) return res.status(404).json({ error: 'not_found' });
-  return res.status(200).json(r);
+  try {
+    const r = await rankOf(req.params.playerId);
+    if (!r) return res.status(404).json({ error: 'not_found' });
+    return res.status(200).json(r);
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'rank_query_failed' });
+  }
 });
 
 module.exports = router;

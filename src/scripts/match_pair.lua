@@ -9,5 +9,13 @@ if not b then
   redis.call('RPUSH', KEYS[1], a) -- 放回，保持队列完整
   return { 'single' }
 end
-redis.call('HSET', KEYS[2] .. ARGV[1], 'a', a, 'b', b)
+local roomKey = KEYS[2] .. ARGV[1]
+redis.call('HSET', roomKey, 'a', a)
+redis.call('HSET', roomKey, 'b', b)
+redis.call('EXPIRE', roomKey, 60)
+-- 玩家到房间映射（便于按玩家查询配对结果）
+redis.call('SET', 'mm:player-room:' .. a, ARGV[1])
+redis.call('EXPIRE', 'mm:player-room:' .. a, 60)
+redis.call('SET', 'mm:player-room:' .. b, ARGV[1])
+redis.call('EXPIRE', 'mm:player-room:' .. b, 60)
 return { 'paired', a, b }
